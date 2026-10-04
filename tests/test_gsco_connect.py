@@ -114,4 +114,52 @@ assert run("test")[0] == 1
 
 rc, out = run("forget")
 assert "removed" in out and not g.CONFIG.exists()
+
+# ---- the page: same steps over a local HTTP API, for this machine's browser only
+import argparse, re, time, urllib.request, urllib.error
+CLAIMED.clear()
+threading.Thread(target=lambda: g.cmd_ui(argparse.Namespace(port=0, no_browser=True)), daemon=True).start()
+import gc
+for _ in range(50):
+    time.sleep(0.1)
+    servers = [o for o in gc.get_objects() if type(o).__name__ == "ThreadingHTTPServer"]
+    if servers:
+        break
+UI = f"http://127.0.0.1:{servers[0].server_port}"
+
+
+def ui(method, path, body=None, token=None, host=None):
+    req = urllib.request.Request(UI + path, method=method, data=json.dumps(body).encode() if body is not None else None,
+                                 headers={"Content-Type": "application/json", **({"X-Token": token} if token else {}), **({"Host": host} if host else {})})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return r.status, r.read()
+    except urllib.error.HTTPError as e:
+        return e.code, e.read()
+
+
+st, page = ui("GET", "/")
+assert st == 200 and b"GSCO platform access" in page and b"gsco_testkey" not in page
+TOKEN = re.search(rb'const T = "([^"]+)"', page).group(1).decode()
+assert ui("GET", "/api/state")[0] == 403 and ui("GET", "/api/state", token="wrong")[0] == 403      # the page's token is needed
+assert ui("GET", "/", host="evil.example")[0] == 403                                               # and the right Host
+assert ui("POST", "/api/forget", {}, host="evil.example", token=TOKEN)[0] == 403
+st, raw = ui("GET", "/api/state", token=TOKEN)
+state = json.loads(raw)
+assert st == 200 and state["access"] is None and "tailscale" in state and "key" not in raw.decode()
+st, raw = ui("POST", "/api/request", {"name": "Alice Example", "login": "alice@example.org", "note": "Uni X"}, TOKEN)
+assert st == 200 and "name: Alice Example" in json.loads(raw)["text"] and "note: Uni X" in json.loads(raw)["text"]
+st, raw = ui("POST", "/api/join", {"code": "nonsense"}, TOKEN)
+assert st == 400 and "invite code" in json.loads(raw)["error"]
+st, raw = ui("POST", "/api/test", {}, TOKEN)
+assert st == 400 and "no access yet" in json.loads(raw)["error"]
+st, raw = ui("POST", "/api/join", {"code": code_for(URL, "goodsecret")}, TOKEN)
+assert st == 200 and json.loads(raw)["name"] == "alice" and b"gsco_testkey" not in raw
+st, raw = ui("GET", "/api/state", token=TOKEN)
+assert json.loads(raw)["access"]["name"] == "alice" and b"gsco_testkey" not in raw                  # the key never reaches the page
+st, raw = ui("POST", "/api/test", {}, TOKEN)
+assert st == 200 and json.loads(raw) == {"tools": 3, "groups": {"geo": 2, "platform": 1}}
+st, raw = ui("POST", "/api/forget", {}, TOKEN)
+assert st == 200 and json.loads(raw)["removed"] and not g.CONFIG.exists()
+assert ui("POST", "/api/nothing", {}, TOKEN)[0] == 404
 print("gsco-connect: all checks pass")
